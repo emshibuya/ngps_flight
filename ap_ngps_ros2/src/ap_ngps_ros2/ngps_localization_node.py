@@ -99,6 +99,11 @@ class NGPSLocalizationNode(Node):
         
         self.tot_rot = 0.0
         self._pending_kernel_rot_step_deg = 0.0
+        self._vehicle_heading_deg: Optional[float] = None
+        self._vehicle_heading_mono_s: Optional[float] = None
+        self._kernel_heading_logged = False
+        self._reject_streak = 0
+        self._kernel_size_before_loss: Optional[int] = None
         self.base_x = 0
         self.base_y = 0
         self.x = 0
@@ -383,6 +388,30 @@ class NGPSLocalizationNode(Node):
 
     def _alt_geopose_cb(self, msg: GeoPoseStamped) -> None:
         self._set_altitude_m(msg.pose.position.altitude)
+        q = msg.pose.orientation
+        norm = math.sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w)
+        if norm < 0.5:
+            return
+        self._vehicle_heading_deg = self._heading_deg_from_enu_quat(q.x, q.y, q.z, q.w)
+        self._vehicle_heading_mono_s = time.monotonic()
+
+    def _fresh_vehicle_heading_deg(self) -> Optional[float]:
+        if self._vehicle_heading_deg is None or self._vehicle_heading_mono_s is None:
+            return None
+        if time.monotonic() - self._vehicle_heading_mono_s > 0.5:
+            return None
+        return self._vehicle_heading_deg
+
+    @staticmethod
+    def _heading_deg_from_enu_quat(x: float, y: float, z: float, w: float) -> float:
+        """North-referenced heading from the ENU quaternion on /ap/geopose/filtered.
+
+        ENU yaw 0 points east. Heading 0 points north, which is the kernel angle.
+        """
+        enu_yaw_deg = math.degrees(
+            math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        )
+        return (90.0 - enu_yaw_deg + 180.0) % 360.0 - 180.0
 
     def _alt_pose_cb(self, msg: PoseStamped) -> None:
         self._set_altitude_m(abs(msg.pose.position.z))
@@ -689,6 +718,58 @@ class NGPSLocalizationNode(Node):
         )
         self._active_kernel_size = capped
 
+    def _apply_kernel_rotation(self) -> None:
+        """Point the map window along the nose. Without a fresh heading, apply the pending step."""
+        heading = self._fresh_vehicle_heading_deg()
+        if heading is None:
+            self.tot_rot += float(self._pending_kernel_rot_step_deg)
+            self._pending_kernel_rot_step_deg = 0.0
+            return
+        # This sign matches east and west. The opposite sign turns the map 180°.
+        self.tot_rot = heading
+        self._pending_kernel_rot_step_deg = 0.0
+        if not self._kernel_heading_logged:
+            self.get_logger().info(
+                f'kernel rotation uses vehicle heading ({self.tot_rot:.1f} deg)'
+            )
+            self._kernel_heading_logged = True
+
+    def _update_kernel_size_after_frame(self, accepted: bool, out_h: int, out_w: int) -> None:
+        """After three misses, grow the window. A later match restores the size from before the misses."""
+        if accepted:
+            self._reject_streak = 0
+            previous = self._kernel_size_before_loss
+            self._kernel_size_before_loss = None
+            if previous is None or previous == self._active_kernel_size:
+                return
+            self.get_logger().info(
+                f'kernel_size {self._active_kernel_size} -> {previous} (match)'
+            )
+            self._active_kernel_size = previous
+            return
+
+        if self._reject_streak == 0:
+            self._kernel_size_before_loss = self._active_kernel_size
+        self._reject_streak += 1
+        if self._reject_streak < 3:
+            return
+        grow_factor = float(
+            self.get_parameter('kernel_grow_factor').get_parameter_value().double_value
+        )
+        if grow_factor <= 1.0:
+            return
+        max_size = self._kernel_max_size_active
+        if out_h > 0 and out_w > 0:
+            max_size = min(max_size, self._max_kernel_long_edge(out_h, out_w))
+        new_size = int(round(self._active_kernel_size * grow_factor))
+        capped = min(max_size, max(self._active_kernel_size + 1, new_size))
+        if capped <= self._active_kernel_size:
+            return
+        self.get_logger().info(
+            f'kernel_size {self._active_kernel_size} -> {capped} (lost)'
+        )
+        self._active_kernel_size = capped
+
     def kernel_show(
         self,
         center_row: int,
@@ -720,9 +801,7 @@ class NGPSLocalizationNode(Node):
         center_row = int(np.clip(center_row, min_row, max_row))
         center_col = int(np.clip(center_col, min_col, max_col))
 
-        step = float(self._pending_kernel_rot_step_deg)
-        self.tot_rot += step
-        self._pending_kernel_rot_step_deg = 0.0
+        self._apply_kernel_rotation()
 
         # Rotate a local patch only (not the full mosaic) for much lower CPU cost.
         pad_row = int(math.ceil(math.hypot(crop_h, crop_w) * 0.25))
@@ -905,6 +984,9 @@ class NGPSLocalizationNode(Node):
             self._frame_lock.release()
 
     def _process_localization_frame_impl(self, frame):
+        accepted = False
+        out_h = 0
+        out_w = 0
         try:
             resize_scale = float(
                 self.get_parameter('camera_resize_scale').get_parameter_value().double_value
@@ -918,9 +1000,13 @@ class NGPSLocalizationNode(Node):
                     interpolation=cv.INTER_AREA,
                 )
             hh, ww = frame.shape[:2]
-            
+            out_h, out_w = hh, ww
+
             self.base_x, self.base_y = self.map_kernel_img(self.y, self.x, self.base_x, self.base_y)
-            
+            # Consume the residual once. A rejected frame must not add it again.
+            self.x = 0
+            self.y = 0
+
             img_kl, kernel_scale_row, kernel_scale_col = self.kernel_show(
                 int(self.base_x),
                 int(self.base_y),
@@ -1066,6 +1152,7 @@ class NGPSLocalizationNode(Node):
             self.x = x_new
             self.y = y_new
             self._prev_kernel_xy = (float(self.x), float(self.y))
+            accepted = True
 
             self.publish_results()
 
@@ -1078,6 +1165,8 @@ class NGPSLocalizationNode(Node):
 
         except Exception as e:
             self.get_logger().warning(f'localization frame: {e}')
+        finally:
+            self._update_kernel_size_after_frame(accepted, out_h, out_w)
 
     def _should_publish_match_pair_panel(self) -> bool:
         if not self._publish_match_pair or self.match_pair_pub is None:

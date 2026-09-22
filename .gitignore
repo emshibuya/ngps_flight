@@ -8,3 +8,4 @@ ap_ngps_ros2/weights/*.onnx
 ap_ngps_ros2/weights/*.trt-ready.onnx
 .superpowers/
 docs/superpowers/
+.pytest_cache/
