@@ -41,29 +41,57 @@ Setup and configuration guide for GPS-free navigation using visual-inertial syst
 
 ## ArduPilot Configuration
 
-### Enable External Navigation
+EKF3 must be the active estimator: `AHRS_EKF_TYPE = 3` and `EK3_ENABLE = 1` (the Copter defaults).
 
-1. Set `EK3_ENABLE = 1` (enable EKF3)
-2. Set `EK3_SRC1_POSXY = 3` (external position source)
-3. Set `EK3_SRC1_VELXY = 3` (external velocity source)
-4. Set `EK3_SRC1_POSZ = 1` (barometric altimeter for altitude)
-5. Set `EK3_SRC1_VELZ = 1` (barometric altimeter for vertical velocity)
+### External position input (`VISO_*`)
 
-### Configure Position Source
+ArduPilot receives NGPS through its visual odometry interface, so these are `VISO_*` parameters,
+although NGPS provides an absolute position rather than odometry.
 
-Set `EK3_SRC1_POSXY = 3` to use external position from MAVLink VISION_POSITION_ESTIMATE message.
+| Parameter | Value | Notes |
+|---|---|---|
+| `VISO_TYPE` | **1** (MAVLink) | Do not use 2 (IntelT265) |
+| `VISO_DELAY_MS` | measured latency | Time from image capture to `/ap/tf` arrival, 250 ms at most |
+| `VISO_QUAL_MIN` | 0 | |
 
-### Configure Velocity Source
+### EKF source sets
 
-Set `EK3_SRC1_VELXY = 3` to use external velocity from MAVLink VISION_SPEED_ESTIMATE message.
+Keep GPS as the primary source set and put NGPS in the secondary set.
 
-### Other Important Parameters
+| Parameter | Set 1: GPS | Set 2: NGPS |
+|---|---|---|
+| `EK3_SRCn_POSXY` | 3 (GPS) | **6 (ExternalNav)** |
+| `EK3_SRCn_VELXY` | 3 (GPS) | 0 (None) |
+| `EK3_SRCn_POSZ` | 1 (Baro) | 1 (Baro) |
+| `EK3_SRCn_VELZ` | 3 (GPS) | 0 (None) |
+| `EK3_SRCn_YAW` | 1 (Compass) | 1 (Compass) |
+
+`n` is 1 for set 1 and 2 for set 2. NGPS sends position only, so set 2 takes no velocity from it.
+Keep yaw on the compass.
+
+### Switching source sets from the transmitter
+
+Assign an RC channel to the EKF source set switch:
 
 ```
-EK3_GLITCH_RAD = 5.0          # Position glitch protection radius (meters)
-EK3_REJECT_GPS = 0            # Don't reject GPS (if available)
-AHRS_EKF_TYPE = 3           # Use EKF3
+RC7_OPTION = 90    # EKF Source Set (any free channel works)
 ```
+
+| Switch position | Source set |
+|---|---|
+| Low | 1 (GPS) |
+| Middle | 2 (NGPS) |
+| High | 3 (unused here) |
+
+In SITL, flip the switch from MAVProxy:
+
+```
+rc 7 1500    # middle: set 2, NGPS
+rc 7 1000    # low: set 1, GPS
+```
+
+To compare NGPS against GPS without flying on it, leave the switch low. ArduPilot still logs every
+`/ap/tf` sample as `VISP`, and the `GPS` message keeps the true position.
 
 ## MAVROS Configuration
 
